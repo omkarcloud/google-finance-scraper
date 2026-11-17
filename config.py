@@ -35,3 +35,22 @@ def google_finance_proxy():
 
 def google_finance_fallback_proxy():
     return None
+
+
+# ---- added by the sync: defaults for a direct run ----
+INPAGE_BROWSER_SLOTS = 1
+def burst_slots(share):
+    return share
+
+
+def gateway_exit(exit=None):
+    return None
+
+
+def google_finance_fallback_exits():
+    return ()
+
+
+def google_finance_step_proxy(step=None):
+    return None
+

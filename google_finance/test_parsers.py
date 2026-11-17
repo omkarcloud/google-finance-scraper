@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from google_finance import (charts, fetch, fundamentals, holdings, insights, markets, news, parsers,  # noqa: E402
                             peers, quotes, symbols)
+from scraper_utils.testing import hosted_only
 
 FX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 S = symbols.parse_symbol
@@ -324,3 +325,44 @@ def test_markets():
     with replay("market_news_us"):
         mn = news.market_news(limit=5)
     assert mn["market_summary"][0]["sources"] and mn["latest_news"] and mn["top_stories"][0]["link"]
+
+
+class _FakeBox:
+    """browser_client.fetch_any stand-in: records every candidate list and
+    answers from the candidate `picks` names, raising BoxRefused on the
+    picks given as ("refuse", i)."""
+    def __init__(self, picks):
+        self.picks, self.offered, self.sessions, self.calls = list(picks), [], [], []
+
+    def __call__(self, site, candidates, **kw):
+        import browser_client
+        self.calls.append(site)
+        self.offered.append([p for p, _s in candidates])
+        self.sessions.append([s for _p, s in candidates])
+        pick = self.picks.pop(0)
+        if isinstance(pick, tuple):
+            raise browser_client.BoxRefused("refused", candidate=pick[1])
+        return pick, {"status": 200, "body": f"from-browser-{pick}", "final_url": kw.get("url")}
+
+
+@hosted_only
+def test_box_pool_bursts_and_rotates_only_the_used_exit(monkeypatch):
+    import config
+    import browser_client
+    ports = iter(range(20001, 20100))
+    monkeypatch.setattr(config, "google_finance_fallback_proxy", lambda: f"http://us:{next(ports)}")
+    monkeypatch.setattr(config, "INPAGE_BROWSER_SLOTS", 2)
+    monkeypatch.setattr(config, "BROWSER_BURST_FACTOR", 4)
+    box = _FakeBox([0, 1, 0, ("refuse", 1)])
+    monkeypatch.setattr(browser_client, "fetch_any", box)
+    fetch._EXITS.reset()
+    url = "https://www.google.com/finance/quote/AAPL:NASDAQ"
+    assert fetch._box_fetch("GET", url, {}, None, "t").endswith("-0")
+    assert fetch._box_fetch("GET", url, {}, None, "t").endswith("-1")
+    assert fetch._box_fetch("GET", url, {}, None, "t").endswith("-0")
+    first = box.offered[0]
+    assert len(first) == 8 and len(set(first)) == 8 and box.offered[2] == first
+    with pytest.raises(fetch.FinanceBlocked):
+        fetch._box_fetch("GET", url, {}, None, "t")
+    after = fetch._EXITS.current()
+    assert after[1] != first[1] and after[0] == first[0] and after[2:] == first[2:]

@@ -14,11 +14,18 @@ module is the whole transport.
 
 Escalation per call (config.GOOGLE_FINANCE_*):
   1. the thread's curl session (direct egress);
-  2. a thread whose call was refused (403 / 429 / /sorry) moves to a
-     residential exit for GOOGLE_FINANCE_DIRECT_COOLDOWN seconds;
+  2. a thread whose call was refused (403 / 429 / /sorry) moves one
+     fallback step down for GOOGLE_FINANCE_DIRECT_COOLDOWN seconds: since
+     2026-11-11 first to the shared gateway
+     (GOOGLE_FINANCE_FALLBACK_EXIT = "gateway", exit_gateway.py: a fresh gateway
+     address on nearly every request; the numbers are in config.py), and
+     only when that is refused too to a residential exit
+     (GOOGLE_FINANCE_FALLBACK_PROXY_COUNTRY). A call the gateway keeps
+     failing without a refusal (the gateway's own errors) makes its last
+     attempt on the residential exit;
   3. after GOOGLE_FINANCE_MAX_ATTEMPTS blocked attempts, one headful
      patchright Chrome loads /finance/beta and replays the POST as an
-     in-page fetch.
+     in-page fetch (on a residential exit, never the gateway).
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   FinanceUpstreamError  transport failure / 5xx / unparseable body  -> 502
@@ -27,6 +34,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   FinanceNotFound       unknown symbol                              -> 404
 """
 import json
+import fastjson
 import os
 import sys
 import threading
@@ -35,10 +43,14 @@ from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import browser_client  # noqa: E402
 import config  # noqa: E402
+import egress  # noqa: E402
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError  # noqa: E402
+from scraper_utils import debug, sessions
 
 SITE = "https://www.google.com"
+SITE_KEY = "google-finance"           # recipe name on the browser box
 HOME = f"{SITE}/finance/beta"
 BATCH_PATH = "/finance/beta/_/FinHubUi/data/batchexecute"
 IMPERSONATE = "chrome"
@@ -48,7 +60,7 @@ BLOCK_STATUSES = (403, 429)
 
 HEADERS = {
     "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("google-finance"),
     "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
     "origin": SITE,
     "referer": HOME,
@@ -91,53 +103,84 @@ class RpcError(Exception):
 
 def dump_debug(name, text):
     """Write a raw body to $GOOGLE_FINANCE_DEBUG_DIR/<name>.txt."""
-    dbg = os.environ.get("GOOGLE_FINANCE_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w") as f:
-                f.write(text if isinstance(text, str) else repr(text))
-        except OSError:
-            pass
+    debug.dump("GOOGLE_FINANCE_DEBUG_DIR", name, text, render=repr)
 
 
 # ---- curl sessions -------------------------------------------------------------------------
-# One curl session per worker thread (a curl handle must not be shared
-# across threads); it keeps its keep-alive connection for the thread's life.
+# One session per worker thread (a curl handle must not be shared across
+# threads; egress.new_session: curl_cffi, or the gateway exit's look-alike);
+# it keeps its keep-alive connection for the thread's life. A thread whose
+# direct egress got blocked moves down the fallback steps
+# (config.google_finance_fallback_exits(): the gateway exit, then a
+# residential exit) until `proxy_until`, then goes back to direct.
 _local = threading.local()
 
 
+def _gateway_step(step):
+    """True when fallback step `step` is the gateway exit with another exit
+    configured behind it."""
+    exits = config.google_finance_fallback_exits()
+    return 0 < step < len(exits) and bool(config.gateway_exit(exits[step - 1]))
+
+
+def _step():
+    """This thread's fallback step: 0 = the configured exit (the server's
+    own IP), 1, 2 = config.google_finance_step_proxy(step) while its
+    cooldown runs; one step past the gateway for the last attempt of a call
+    the gateway keeps failing (_retry_fresh)."""
+    step = getattr(_local, "step", 1) if getattr(_local, "proxy_until", 0) > time.time() else 0
+    if getattr(_local, "past_gateway", False) and _gateway_step(step):
+        step += 1
+    return step
+
+
 def _session():
-    via_fallback = getattr(_local, "proxy_until", 0) > time.time()
+    step = _step()
     sess = getattr(_local, "session", None)
-    if sess is not None and getattr(sess, "_gf_fallback", False) != via_fallback:
+    if sess is not None and getattr(sess, "_gf_step", 0) != step:
         _drop_session()
         sess = None
     if sess is None:
-        from curl_cffi import requests as curl_requests
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
-        proxy = config.google_finance_proxy() or (config.google_finance_fallback_proxy() if via_fallback else None)
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
-        sess._gf_fallback = via_fallback
+        proxy = config.google_finance_proxy() or (config.google_finance_step_proxy(step) if step else None)
+        sess = egress.new_session(proxy, impersonate=IMPERSONATE)     # None, a proxy URL, or the gateway exit ("gateway")
+        sess._gf_step = step
         _local.session = sess
     return sess
 
 
 def _drop_session():
-    sess = getattr(_local, "session", None)
-    _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop(_local)
 
 
 def _escalate():
-    """This thread's exit was refused: move it to a residential exit for a while."""
-    if config.google_finance_fallback_proxy() is not None:
+    """This thread's exit was refused: move it one fallback step down for a
+    while (own IP -> the gateway exit -> residential; on the last step it
+    stays there on a fresh exit). None configured = just rebuild the session."""
+    exits = config.google_finance_fallback_exits()
+    if getattr(_local, "past_gateway", False):
+        # the refused exit was the one borrowed behind the gateway for this
+        # call's last attempt (_retry_fresh): no verdict on the gateway, the
+        # thread keeps its own step and cooldown
+        _drop_session()
+        return
+    step = min(_step() + 1, len(exits))
+    if step:
+        if any(config.gateway_exit(e) for e in exits):     # how often each step is refused is the number to watch
+            print(f"google-finance: exit refused, thread on fallback step {step} ({exits[step - 1]}) "
+                  f"for {config.GOOGLE_FINANCE_DIRECT_COOLDOWN} s")
+        _local.step = step
         _local.proxy_until = time.time() + config.GOOGLE_FINANCE_DIRECT_COOLDOWN
+    _drop_session()
+
+
+def _retry_fresh(attempt, attempts):
+    """A transport failure / 5xx, not a refusal: the retry rides a fresh
+    session. While the thread is on the gateway exit step the LAST attempt of
+    the call rides the next step (the residential exit), for that call only:
+    the gateway's own errors (its throttle, its 29 s timeout) are no verdict
+    on the exit, so they must not park the thread on the paid proxy."""
+    if attempt + 1 == attempts and _gateway_step(_step()):
+        _local.past_gateway = True
     _drop_session()
 
 
@@ -164,77 +207,32 @@ def _curl_post(url, body, label):
     return _classify(resp.status_code, str(resp.url or ""), resp.text or "", label)
 
 
-# ---- browser fallback ------------------------------------------------------------------------
+# ---- browser fallback (on the browser box) ---------------------------------------------------
 
-class _Browser:
-    """One headful patchright Chrome on /finance/beta, opened on demand,
-    reused while busy and closed after GOOGLE_FINANCE_BROWSER_IDLE_SECONDS."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.driver = None
-        self.last_used = 0.0
-        self.closer = None
-
-    def _open(self):
-        from chrome_manager import create_scope
-        from patchright_driver import PatchrightDriver
-        with create_scope():
-            driver = PatchrightDriver(proxy_url=config.google_finance_fallback_proxy(), headless=False)
-        try:
-            driver.nav(HOME, mode="blocked", challenge_markers=("unusual traffic",))
-        except Exception:
-            driver.close()
-            raise
-        return driver
-
-    def _close_if_idle(self):
-        while True:
-            time.sleep(30)
-            with self.lock:
-                if self.driver is None:
-                    self.closer = None
-                    return
-                if time.time() - self.last_used > config.GOOGLE_FINANCE_BROWSER_IDLE_SECONDS:
-                    self._drop()
-                    self.closer = None
-                    return
-
-    def _drop(self):
-        if self.driver is not None:
-            try:
-                self.driver.close()
-            except Exception:
-                pass
-        self.driver = None
-
-    def post(self, path_and_query, body, label):
-        from patchright_driver import _FETCH_JS, FETCH_TIMEOUT_MS
-        headers = {k: v for k, v in HEADERS.items() if not k.startswith(("sec-", "origin", "referer", "accept-language"))}
-        with self.lock:
-            if self.driver is None:
-                self.driver = self._open()
-            if self.closer is None:
-                self.closer = threading.Thread(target=self._close_if_idle, daemon=True)
-                self.closer.start()
-            self.last_used = time.time()
-            try:
-                res = self.driver.call(lambda page: page.evaluate(_FETCH_JS, {
-                    "url": SITE + path_and_query, "method": "POST", "headers": headers,
-                    "body": body, "referrer": HOME, "timeoutMs": FETCH_TIMEOUT_MS}))
-            except Exception:
-                self._drop()
-                raise
-        if not res or (not res.get("status") and res.get("error")):
-            raise FinanceUpstreamError(f"browser fetch failed on {label}: {(res or {}).get('error')}")
-        status = int(res.get("status") or 0)
-        if status in BLOCK_STATUSES:
-            with self.lock:
-                self._drop()
-        return _classify(status, res.get("url") or "", res.get("body") or "", label)
+# One sticky US residential exit for the box's parked /finance/beta page; the
+# token-less calls replay as in-page fetches there (recipes/google_finance.py).
+# A refusal (403/429/sorry) burns the exit: the box closes that browser and
+# the next fallback call starts on a fresh one. Chrome left GKE 2026-10-22.
+# Sticky US residential exits per parked box browser (browser_client.ExitPool:
+# the box keys its browser by the proxy URL; rotate only the exit a call
+# failed on). INPAGE_BROWSER_SLOTS browsers are the share; the pool offers
+# share x BROWSER_BURST_FACTOR candidates and the box picks an idle one or
+# opens another while it has headroom (2026-11-04).
+_EXITS = browser_client.ExitPool(SITE_KEY, lambda: config.google_finance_fallback_proxy(),
+                                 size=lambda: config.INPAGE_BROWSER_SLOTS, burst=True)
 
 
-_browser = _Browser()
+def _box_fetch(method, url, headers, body, label):
+    """Replay one blocked call on the box's parked page -> text (classified)."""
+    try:
+        _proxy, res = _EXITS.fetch_any(SITE_KEY, url=url, method=method, headers=headers or {}, body=body)
+    except browser_client.BoxRefused as e:
+        _EXITS.rotate(e.proxy)                   # only the exit the box was using
+        raise FinanceBlocked(f"{label}: refused in the box browser: {e}") from e
+    except browser_client.BoxUnavailable as e:
+        raise FinanceUpstreamError(f"{label}: browser box unavailable: {e}") from e
+    status = int(res.get("status") or 0)
+    return _classify(status, res.get("final_url") or "", res.get("body") or "", label)
 
 
 # ---- batchexecute ----------------------------------------------------------------------------
@@ -243,6 +241,7 @@ def _post(path_and_query, body, label):
     """One POST with the escalation ladder -> response text."""
     attempts = max(1, int(config.GOOGLE_FINANCE_MAX_ATTEMPTS))
     last, blocked_only = None, True
+    _local.past_gateway = False       # a new call starts on the thread's own step again
     for attempt in range(1, attempts + 1):
         try:
             return _curl_post(SITE + path_and_query, body, label)
@@ -253,11 +252,11 @@ def _post(path_and_query, body, label):
             _escalate()
         except FinanceUpstreamError as e:
             last, blocked_only = e, False
-            _drop_session()
+            _retry_fresh(attempt, attempts)
         if attempt < attempts:
             time.sleep(min(config.RETRY_BACKOFF * attempt, 4))
     if blocked_only and config.GOOGLE_FINANCE_BROWSER_FALLBACK:
-        return _browser.post(path_and_query, body, label)
+        return _box_fetch("POST", SITE + path_and_query, HEADERS, body, label)
     raise last
 
 
@@ -270,13 +269,13 @@ def decode(text, label="batchexecute"):
     out = {}
     candidates = []
     try:
-        candidates.append(json.loads(body))
+        candidates.append(fastjson.loads(body))
     except ValueError:
         for line in body.splitlines():
             line = line.strip()
             if line.startswith("[["):
                 try:
-                    candidates.append(json.loads(line))
+                    candidates.append(fastjson.loads(line))
                 except ValueError:
                     continue
     for chunk in candidates:
@@ -291,7 +290,7 @@ def decode(text, label="batchexecute"):
             data = None
             if isinstance(payload, str):
                 try:
-                    data = json.loads(payload)
+                    data = fastjson.loads(payload)
                 except ValueError:
                     dump_debug(f"badjson_{label}_{rpcid}", payload)
                     code = code or "unparseable"

@@ -1,10 +1,10 @@
 """Generic value helpers for Google's positional arrays. A copy of the five
 google_search/shared.py helpers this package uses, kept local so
-google_finance is self-contained (it ships standalone as the open-source
+google_finance needs nothing from another site (it ships as the open-source
 Google Finance Scraper)."""
-import html as htmllib
 import re
 from datetime import datetime, timezone
+from scraper_utils.text import plain as clean_text
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
@@ -21,16 +21,6 @@ def at(seq, *path, default=None):
         if cur is None:
             return default
     return cur
-
-
-def clean_text(value):
-    """Strip tags, unescape entities and collapse whitespace; '' -> None."""
-    if value is None:
-        return None
-    text = _TAG_RE.sub("", str(value))
-    text = htmllib.unescape(text)
-    text = _WS_RE.sub(" ", text).strip()
-    return text or None
 
 
 def to_int(value):
